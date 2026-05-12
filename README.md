@@ -1,7 +1,7 @@
 # NYC Yellow Taxi — Trips Above the 90th Percentile in Distance
 
-Filter NYC Yellow Taxi trips that exceed the **global 90th percentile of `trip_distance`**
-across any set of monthly parquet files from the
+Filter NYC Yellow Taxi trips that exceed the **per-file 90th percentile of `trip_distance`**
+from monthly parquet files published by the
 [TLC Trip Record Data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page).
 
 ---
@@ -17,28 +17,58 @@ natively via SQL. It was chosen because:
 - **Parquet-native** — scans columnar data efficiently without loading everything into RAM.
 - **SQL percentile function** — `quantile_cont(col, 0.9)` computes the exact 90th percentile
   in a single pass.
-- **Multi-file glob** — `read_parquet('data/raw/*.parquet')` treats multiple files as one
-  logical table, so the percentile is always *global* (not per-file).
 - **Minimal dependencies** — the entire pipeline is `duckdb` + `requests`.
 
 ### Pipeline steps
 
 ```
-Download (requests)          Process (DuckDB)               Output
-─────────────────   ──────────────────────────────────   ──────────────
-TLC CloudFront  →  data/raw/  →  p90 threshold  →  filter  →  data/output/
-*.parquet                         (global)                   filtered_trips.parquet
-                                                             summary.json
+Download (requests)         Process (DuckDB, per file)             Output
+─────────────────   ──────────────────────────────────────   ──────────────────
+TLC CloudFront  →  data/raw/  →  per-file P90  →  filter  →  data/output/
+*.parquet                         threshold                   filtered_trips.parquet
+                                                              summary.json
 ```
 
 1. **Download** — fetch the requested monthly parquet file(s) from the TLC CloudFront CDN
    and save them to `data/raw/`. Already-downloaded files are skipped.
-2. **Compute threshold** — one SQL query calculates the 90th percentile of `trip_distance`
-   across all files in `data/raw/`, excluding nulls and zero-distance records.
-3. **Filter** — a second query writes every trip where `trip_distance > p90` to
-   `data/output/filtered_trips.parquet`.
-4. **Summarise** — a JSON file (`data/output/summary.json`) records the threshold, row counts,
-   and distance statistics for the filtered set.
+2. **Compute threshold per file** — for each parquet file, one SQL query calculates the
+   90th percentile of `trip_distance`, excluding nulls and zero-distance records.
+3. **Filter** — trips where `trip_distance > p90` for that file are written to a temp
+   parquet, then all temp files are merged into `data/output/filtered_trips.parquet`.
+4. **Summarise** — `data/output/summary.json` records per-file thresholds, row counts,
+   and aggregate totals.
+
+---
+
+## Design decisions
+
+### Per-file vs global percentile
+
+The percentile is computed independently per file (per month). Each monthly file
+represents a distinct operational period; seasonal demand shifts (summer vs winter,
+pre- vs post-COVID) mean that a global threshold computed across years would be skewed
+by whichever period dominates the dataset. Per-file percentiles make outlier detection
+relative to each month's own distribution, which is more actionable for the customer.
+
+### Strictly greater than (`>`) vs greater-or-equal (`>=`)
+
+The 90th percentile value is the *boundary* between normal and outlier territory — it is
+by definition the last "normal" data point, not itself an outlier. Using `>` ensures we
+flag only trips that unambiguously exceed the threshold. Using `>=` would include the
+boundary value, which would inflate the flagged set without adding meaningful signal.
+
+### `trip_distance` vs geographic distance
+
+`trip_distance` is what the taxi meter recorded — the actual business metric the customer
+cares about. Computing geographic (straight-line) distance from pickup/dropoff coordinates
+would introduce two problems:
+
+1. **Semantic mismatch** — a high-distance trip via a circuitous route, bridge detour,
+   or traffic diversion would look short geographically but is a genuine long trip. The
+   customer wants outliers in their *recorded* data, not in straight-line geography.
+2. **Data quality** — a meaningful fraction of TLC records have missing or zero-valued
+   coordinates; geographic distance cannot be computed for those rows, causing silent
+   data loss.
 
 ---
 
@@ -47,9 +77,9 @@ TLC CloudFront  →  data/raw/  →  p90 threshold  →  filter  →  data/outpu
 | # | Assumption |
 |---|-----------|
 | 1 | **"Any of the parquet files"** = Yellow Taxi monthly files. Green Taxi, FHV, and HVFHV datasets are out of scope. |
-| 2 | **"0.9 percentile"** = 90th percentile (top 10 % by distance). |
-| 3 | The percentile is computed **globally** across all downloaded files combined, not per-file. |
-| 4 | Rows where `trip_distance` is `NULL` or `≤ 0` are excluded from percentile computation (data quality). They are also excluded from the filtered output because they cannot be "above" any positive threshold. |
+| 2 | **"0.9 percentile"** = 90th percentile (top 10% by distance). |
+| 3 | Percentile is computed **per file** (per month), not globally across files. |
+| 4 | Rows where `trip_distance` is `NULL` or `≤ 0` are excluded from percentile computation (data quality). They are also excluded from the filtered output because they cannot exceed any positive threshold. |
 | 5 | `trip_distance` is measured in **miles**, as stated in the TLC data dictionary. |
 | 6 | "Latest dataset" = the most recently published monthly file (TLC lags ~2–3 months). |
 | 7 | Raw files and outputs are **not committed** to the repo (`.gitignore`); only the pipeline code is versioned. |
@@ -63,7 +93,7 @@ TLC CloudFront  →  data/raw/  →  p90 threshold  →  filter  →  data/outpu
 ├── src/
 │   ├── __init__.py
 │   ├── downloader.py      # fetch parquet from TLC CDN
-│   └── processor.py       # DuckDB: compute p90, filter, summarise
+│   └── processor.py       # DuckDB: per-file P90, filter, merge, summarise
 ├── data/
 │   ├── raw/               # downloaded parquet files  (gitignored)
 │   └── output/            # filtered_trips.parquet + summary.json  (gitignored)
@@ -143,39 +173,90 @@ python main.py --skip-download
 ### `data/output/filtered_trips.parquet`
 
 A parquet file with the same schema as the source, containing only trips where
-`trip_distance > p90_threshold`.
+`trip_distance > p90_threshold` for their respective monthly file.
 
 ### `data/output/summary.json`
 
-Run metadata and statistics, e.g.:
+Per-file thresholds plus aggregate totals, e.g.:
 
 ```json
 {
-  "generated_at": "2026-05-11T10:00:00+00:00",
-  "input_files": ["yellow_tripdata_2025-02.parquet"],
-  "p90_threshold_miles": 4.2,
-  "total_valid_trips": 2845312,
-  "filtered_trips": 284532,
-  "share_above_p90_pct": 10.0,
-  "filtered_distance_stats": {
-    "min_miles": 4.2001,
-    "max_miles": 162.5,
-    "mean_miles": 7.83,
-    "median_miles": 6.1
+  "generated_at": "2026-05-11T12:00:00+00:00",
+  "configuration": {
+    "percentile_scope": "per_file",
+    "threshold_operator": "strictly_greater_than",
+    "distance_metric": "trip_distance_miles"
   },
-  "output_parquet": "data/output/filtered_trips.parquet"
+  "per_file": [
+    {
+      "file": "yellow_tripdata_2026-03.parquet",
+      "total_valid_trips": 3831241,
+      "p90_threshold_miles": 8.8,
+      "filtered_trips": 381585,
+      "share_above_p90_pct": 9.9598
+    }
+  ],
+  "totals": {
+    "input_files": 1,
+    "total_valid_trips": 3831241,
+    "filtered_trips": 381585,
+    "share_above_p90_pct": 9.9598
+  },
+  "output_parquet": "data\\output\\filtered_trips.parquet"
 }
 ```
 
 ---
 
-## Design decisions & trade-offs
+## How to productionise this (ongoing repeatable process)
 
-| Decision | Rationale |
-|----------|-----------|
-| DuckDB over pandas | DuckDB reads only the needed columns from parquet (columnar scan), uses streaming aggregation, and handles files larger than RAM. pandas would load everything into memory. |
-| Two-pass query (count + filter) | Keeps logic simple and auditable. DuckDB caches the parquet scan metadata so the second pass re-reads the file efficiently. |
-| `quantile_cont` (continuous) | Returns the exact interpolated value, matching the mathematical definition of the 90th percentile. |
-| No Tinybird | The task asks to evaluate problem-solving ability, not use of managed services. DuckDB provides equivalent analytical power locally. |
-| Streaming download | Files are ~100–500 MB; streaming with chunked writes avoids memory spikes during download. |
-| Glob for multi-file | When multiple months are present in `data/raw/`, DuckDB's `read_parquet('data/raw/*.parquet')` computes the threshold globally across all of them in one query — no Python loop or intermediate concatenation needed. |
+The current solution is designed as a one-time analysis tool. To run it reliably as a
+monthly pipeline, the following changes would be needed:
+
+### 1. Scheduling
+
+Add a monthly cron job (or orchestration step) that triggers `main.py --year YYYY --month MM`
+once TLC publishes new data (typically the 10th of each month, 2–3 months in arrears).
+
+```
+# Example crontab: run on the 10th of every month
+0 6 10 * * cd /app && python main.py --year $(date +%Y) --month $(date -d '-2 months' +%m)
+```
+
+Tools that scale better than cron: **Apache Airflow**, **Prefect**, or **GitHub Actions**
+scheduled workflows.
+
+### 2. Idempotency
+
+The downloader already skips files that exist in `data/raw/`. Add a check in the processor
+to skip re-processing a file whose summary entry already exists, so accidental re-runs are
+safe.
+
+### 3. Output storage
+
+Replace the local parquet write with a persistent store:
+
+- **Object storage** (S3 / GCS / Azure Blob) — append new monthly filtered files as
+  `filtered_trips/year=YYYY/month=MM/part-0.parquet` (Hive-partitioned).
+- **Analytical database** — write directly to DuckDB persistent file, ClickHouse, or
+  BigQuery for long-term querying.
+
+### 4. Alerting / monitoring
+
+After each run, compare `share_above_p90_pct` against historical values. A sudden jump
+(e.g., > 12% or < 8%) could indicate a data quality issue in the source file worth
+investigating.
+
+### 5. Containerisation
+
+Wrap the pipeline in a `Dockerfile` so the execution environment is fully reproducible
+across machines and CI runners:
+
+```dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+ENTRYPOINT ["python", "main.py"]
+```

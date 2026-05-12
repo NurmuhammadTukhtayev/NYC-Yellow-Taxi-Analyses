@@ -2,6 +2,9 @@
 """
 NYC Yellow Taxi — filter trips above the 90th percentile by distance.
 
+Percentile is computed per file (per month). Trips are included when
+trip_distance is STRICTLY greater than the file's own P90 threshold.
+
 Usage examples
 --------------
   # Download the latest available monthly file and process it:
@@ -22,8 +25,12 @@ from pathlib import Path
 
 
 def parse_args() -> argparse.Namespace:
+    """Build and return the argument parser."""
     p = argparse.ArgumentParser(
-        description="Filter NYC Yellow Taxi trips above the 90th percentile in trip distance.",
+        description=(
+            "Filter NYC Yellow Taxi trips above the per-file "
+            "90th percentile in trip distance."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -38,6 +45,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Entry point: download, process, and report."""
     args = parse_args()
 
     if args.month and not args.year:
@@ -59,21 +67,32 @@ def main() -> None:
     summary = process(files)
 
     # ── Report ────────────────────────────────────────────────────────────────
+    totals = summary["totals"]
+
+    sep = "=" * 60
+    header = "  Results (per-file 90th percentile, trip_distance > P90)"
     print()
-    print("=" * 52)
-    print("  Results")
-    print("=" * 52)
-    print(f"  Input files          : {len(files)}")
-    print(f"  Valid trips analyzed : {summary['total_valid_trips']:>12,}")
-    print(f"  P90 threshold        : {summary['p90_threshold_miles']:>12.4f} miles")
-    print(f"  Trips above P90      : {summary['filtered_trips']:>12,}  ({summary['share_above_p90_pct']}%)")
-    print(f"  Distance range       : {summary['filtered_distance_stats']['min_miles']} – "
-          f"{summary['filtered_distance_stats']['max_miles']} miles")
-    print("=" * 52)
-    print(f"  Outputs in: data/output/")
-    print(f"    filtered_trips.parquet")
-    print(f"    summary.json")
-    print("=" * 52)
+    print(sep)
+    print(header)
+    print(sep)
+
+    for r in summary["per_file"]:
+        print(f"  {r['file']}")
+        print(f"    Valid trips      : {r['total_valid_trips']:>12,}")
+        print(f"    P90 threshold    : {r['p90_threshold_miles']:>12.4f} miles")
+        print(f"    Trips above P90  : {r['filtered_trips']:>12,}  ({r['share_above_p90_pct']}%)")
+        print()
+
+    if totals["input_files"] > 1:
+        print(f"  TOTAL across {totals['input_files']} files")
+        print(f"    Trips analyzed   : {totals['total_valid_trips']:>12,}")
+        print(f"    Trips above P90  : {totals['filtered_trips']:>12,}  ({totals['share_above_p90_pct']}%)")
+        print()
+
+    print("  Outputs saved to data/output/")
+    print("    filtered_trips.parquet")
+    print("    summary.json")
+    print(sep)
 
 
 if __name__ == "__main__":
