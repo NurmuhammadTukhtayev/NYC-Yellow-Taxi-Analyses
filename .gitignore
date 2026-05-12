@@ -7,6 +7,9 @@ env/
 data/raw/
 data/output/
 
+# Log files
+logs/
+
 # Python
 __pycache__/
 *.py[cod]

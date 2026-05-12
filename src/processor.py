@@ -10,12 +10,15 @@ strictly above it, merges results, and writes two outputs:
 All DuckDB query logic lives in utils/compute.py.
 """
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
 
 from .utils.compute import compute_file, merge_tmp_files
+
+logger = logging.getLogger(__name__)
 
 OUTPUT_DIR = Path("data/output")
 
@@ -33,13 +36,13 @@ def process(files: list[Path]) -> dict:
     tmp_files: list[Path] = []
 
     for f in files:
-        print(f"\nProcessing {f.name} ...")
+        logger.info("Processing %s ...", f.name)
         tmp = OUTPUT_DIR / f"_tmp_{f.stem}.parquet"
         total, p90, filtered = compute_file(conn, f, tmp)
 
-        print(f"  Valid trips      : {total:>12,}")
-        print(f"  P90 threshold    : {p90:>12.4f} miles")
-        print(f"  Trips above P90  : {filtered:>12,}  ({filtered / total * 100:.2f}%)")
+        logger.info("  Valid trips      : %d", total)
+        logger.info("  P90 threshold    : %.4f miles", p90)
+        logger.info("  Trips above P90  : %d (%.2f%%)", filtered, filtered / total * 100)
 
         per_file_results.append({
             "file": f.name,
@@ -51,7 +54,7 @@ def process(files: list[Path]) -> dict:
         tmp_files.append(tmp)
 
     out_parquet = OUTPUT_DIR / "filtered_trips.parquet"
-    print(f"\nWriting {out_parquet} ...")
+    logger.info("Writing %s ...", out_parquet)
     merge_tmp_files(conn, tmp_files, out_parquet)
 
     total_all = sum(r["total_valid_trips"] for r in per_file_results)
@@ -76,6 +79,6 @@ def process(files: list[Path]) -> dict:
 
     out_json = OUTPUT_DIR / "summary.json"
     out_json.write_text(json.dumps(summary, indent=2))
-    print(f"Summary written to {out_json}")
+    logger.info("Summary written to %s", out_json)
 
     return summary

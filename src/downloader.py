@@ -4,9 +4,12 @@ Public interface for downloading NYC TLC Yellow Taxi parquet files.
 Accepts optional year/month parameters; defaults to the latest available file.
 All HTTP and path logic lives in utils/http.py.
 """
+import logging
 from pathlib import Path
 
 from .utils.http import RAW_DIR, detect_latest, download_file, download_year
+
+logger = logging.getLogger(__name__)
 
 
 def download(year: int | None = None, month: int | None = None) -> list[Path]:
@@ -24,8 +27,11 @@ def download(year: int | None = None, month: int | None = None) -> list[Path]:
         return [download_file(y, m)]
 
     if month is not None:
-        if not (1 <= month <= 12):
-            raise SystemExit("--month must be between 1 and 12.")
+        if month < 1 or month > 12:
+            msg = "--month must be between 1 and 12."
+            logger.error(msg)
+            raise SystemExit(msg)
+        logger.info("Downloading %d-%02d...", year, month)
         return [download_file(year, month)]
 
     return download_year(year)
