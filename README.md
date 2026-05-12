@@ -135,7 +135,7 @@ each utility independently testable.
 
 ```bash
 # 1. Clone / unzip the repo
-cd nyc-taxi-p90
+cd NYC-Yellow-Taxi-Analyses
 
 # 2. Create and activate a virtual environment
 python -m venv .venv
