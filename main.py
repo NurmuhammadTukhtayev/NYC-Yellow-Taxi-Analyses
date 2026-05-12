@@ -78,10 +78,8 @@ def main() -> None:
     try:
         _run(args)
         logger.info("Run complete. Log: %s", log_file)
-    except SystemExit:
-        raise
-    except Exception:
-        logger.exception("Unexpected error. Full traceback written to %s", log_file)
+    except (RuntimeError, OSError) as exc:
+        logger.error("Pipeline failed: %s", exc, exc_info=True)
         sys.exit(1)
 
 
